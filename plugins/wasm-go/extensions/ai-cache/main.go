@@ -3,9 +3,11 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/config"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/entry"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/vector"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -25,6 +27,17 @@ const (
 	SKIP_CACHE_HEADER           = "x-higress-skip-ai-cache"
 	CONSUMER_HEADER             = "x-mse-consumer"
 	ERROR_PARTIAL_MESSAGE_KEY   = "errorPartialMessage"
+
+	// ENTRY_METADATA_CONTEXT_KEY carries the metadata of the completed response
+	// that write paths may store.
+	ENTRY_METADATA_CONTEXT_KEY = "entryMetadata"
+	// RESPONSE_STATUS_CONTEXT_KEY carries the upstream status code for the
+	// completeness gate.
+	RESPONSE_STATUS_CONTEXT_KEY = "responseStatus"
+	// STREAM_DONE_CONTEXT_KEY records that a [DONE] marker has been observed.
+	STREAM_DONE_CONTEXT_KEY = "streamDone"
+	// RESPONSE_TERMINATION_CONTEXT_KEY records why the response ended.
+	RESPONSE_TERMINATION_CONTEXT_KEY = "responseTermination"
 
 	DEFAULT_MAX_BODY_BYTES uint32 = 100 * 1024 * 1024
 )
@@ -88,6 +101,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, c config.PluginConfig, log lo
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
+	if c.GetEntryPolicy().Enabled {
+		vector.SetEntryMetadataEnabled(ctx)
+	}
 	ctx.SetRequestBodyBufferLimit(DEFAULT_MAX_BODY_BYTES)
 	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
 	// The request has a body and requires delaying the header transmission until a cache miss occurs,
@@ -129,7 +145,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, c config.PluginConfig, body []by
 	}
 
 	ctx.SetContext(CACHE_KEY_CONTEXT_KEY, key)
-	log.Debugf("[onHttpRequestBody] key: %s", key)
+	log.Debugf("[onHttpRequestBody] question %s", questionForLog(c, key))
 	if key == "" {
 		log.Debug("[onHttpRequestBody] parse key from request body failed")
 		ctx.DontReadResponseBody()
@@ -141,8 +157,8 @@ func onHttpRequestBody(ctx wrapper.HttpContext, c config.PluginConfig, body []by
 		return types.ActionContinue
 	}
 
-	if err := CheckCacheForKey(key, ctx, c, log, stream, true); err != nil {
-		log.Errorf("[onHttpRequestBody] check cache for key: %s failed, error: %v", key, err)
+	if err := CheckCacheForKey(key, ctx, c, log, stream, true, entry.SourceKV); err != nil {
+		log.Errorf("[onHttpRequestBody] check cache for question %s failed, error: %v", questionForLog(c, key), err)
 		return types.ActionContinue
 	}
 
@@ -161,6 +177,11 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, c config.PluginConfig, log l
 		ctx.SetUserAttribute("cache_status", "miss")
 		ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 	}
+	if statusStr, err := proxywasm.GetHttpResponseHeader(":status"); err == nil {
+		if status, convErr := strconv.Atoi(statusStr); convErr == nil {
+			ctx.SetContext(RESPONSE_STATUS_CONTEXT_KEY, status)
+		}
+	}
 	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
 	if strings.Contains(contentType, "text/event-stream") {
 		ctx.SetContext(STREAM_CONTEXT_KEY, struct{}{})
@@ -172,8 +193,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, c config.PluginConfig, log l
 }
 
 func onHttpResponseBody(ctx wrapper.HttpContext, c config.PluginConfig, chunk []byte, isLastChunk bool, log log.Log) []byte {
-	log.Debugf("[onHttpResponseBody] is last chunk: %v", isLastChunk)
-	log.Debugf("[onHttpResponseBody] chunk: %s", string(chunk))
+	log.Debugf("[onHttpResponseBody] is last chunk: %v, chunkBytes: %d", isLastChunk, len(chunk))
 
 	if ctx.GetContext(TOOL_CALLS_CONTEXT_KEY) != nil || ctx.GetContext(ERROR_PARTIAL_MESSAGE_KEY) != nil {
 		return chunk
@@ -212,7 +232,65 @@ func onHttpResponseBody(ctx wrapper.HttpContext, c config.PluginConfig, chunk []
 		return chunk
 	}
 
+	if policy := c.GetEntryPolicy(); policy.Enabled {
+		metadata, ok := buildEntryMetadata(ctx, policy, log)
+		if !ok {
+			return chunk
+		}
+		ctx.SetContext(ENTRY_METADATA_CONTEXT_KEY, metadata)
+	}
+
 	cacheResponse(ctx, c, key.(string), value, log)
 	uploadEmbeddingAndAnswer(ctx, c, key.(string), value, log)
 	return chunk
+}
+
+// buildEntryMetadata produces the metadata of a completed response, applying
+// the completeness gate. It returns false when the response must not become a
+// hittable entry.
+func buildEntryMetadata(ctx wrapper.HttpContext, policy entry.Policy, log log.Log) (entry.Metadata, bool) {
+	consumer := vector.ConsumerFromContext(ctx)
+	if consumer == "" {
+		return entry.Metadata{}, false
+	}
+	if !responseComplete(ctx, policy, log) {
+		return entry.Metadata{}, false
+	}
+	return entry.Metadata{
+		WrittenAt:  nowFunc(),
+		Tenant:     consumer,
+		Generation: policy.Generation,
+		Complete:   true,
+	}, true
+}
+
+// responseComplete is the write-side completeness judgment. A stream needs its
+// end marker; a non-stream response needs a termination reason that is not a
+// mid-stream truncation. An unsuccessful upstream status is never complete.
+func responseComplete(ctx wrapper.HttpContext, policy entry.Policy, log log.Log) bool {
+	if status, ok := ctx.GetContext(RESPONSE_STATUS_CONTEXT_KEY).(int); ok && (status < 200 || status >= 300) {
+		log.Infof("[responseComplete] upstream status %d is not successful; response will not be cached", status)
+		return false
+	}
+	if ctx.GetContext(ERROR_PARTIAL_MESSAGE_KEY) != nil {
+		log.Infof("[responseComplete] partial response processing failed; response will not be cached")
+		return false
+	}
+	if ctx.GetContext(TOOL_CALLS_CONTEXT_KEY) != nil {
+		log.Infof("[responseComplete] response contains tool calls; response will not be cached")
+		return false
+	}
+	if ctx.GetContext(STREAM_CONTEXT_KEY) != nil {
+		if ctx.GetContext(STREAM_DONE_CONTEXT_KEY) == nil {
+			log.Infof("[responseComplete] stream ended without a [DONE] marker; response will not be cached")
+			return false
+		}
+		return true
+	}
+	termination, _ := ctx.GetContext(RESPONSE_TERMINATION_CONTEXT_KEY).(string)
+	if termination == "" || termination == "length" {
+		log.Infof("[responseComplete] non-stream response has no complete termination reason; response will not be cached")
+		return false
+	}
+	return true
 }

@@ -64,6 +64,10 @@ func (d *WeaviateProvider) QueryEmbedding(
 	if err != nil {
 		return err
 	}
+	metadataFields := ""
+	if EntryMetadataEnabled(ctx) {
+		metadataFields = "\n\t\t  " + WrittenAtField + "\n\t\t  " + GenerationField + "\n\t\t  " + CompleteField
+	}
 	// 这里默认按照 distance 进行升序，所以不用再次排序
 	graphql := fmt.Sprintf(`
 	{
@@ -81,14 +85,14 @@ func (d *WeaviateProvider) QueryEmbedding(
 	    ) {
 		  question
 		  answer
-		  consumer
+		  consumer%s
 	      _additional {
 	        distance
 	      }
 	    }
 	  }
 	}
-	`, d.config.collectionID, d.config.topK, embString, consumerString)
+	`, d.config.collectionID, d.config.topK, embString, consumerString, metadataFields)
 
 	requestBody, err := json.Marshal(weaviateQueryRequest{
 		Query: graphql,
@@ -107,7 +111,7 @@ func (d *WeaviateProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Weaviate] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[Weaviate] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[Weaviate] Failed to parse query response: %v", err)
@@ -133,10 +137,16 @@ func (d *WeaviateProvider) UploadAnswerAndEmbedding(
 	// 最少需要填写的参数为 class, vector 和 question 和 answer
 	// 下面是一个例子
 	// {"class": "Higress", "vector": [0.1, 0.2, 0.3], "properties": {"question": "这里是问题", "answer": "这里是答案"}}
+	properties := weaviateProperties{Question: queryString, Answer: queryAnswer, Consumer: consumer}
+	if m, ok := metadataPayload(ctx); ok {
+		properties.WrittenAt = m.WrittenAt
+		properties.Generation = m.Generation
+		properties.Complete = m.Complete
+	}
 	requestBody, err := json.Marshal(weaviateInsertRequest{
 		Class:      d.config.collectionID,
 		Vector:     queryEmb,
-		Properties: weaviateProperties{Question: queryString, Answer: queryAnswer, Consumer: consumer}, // queryString 指的是用户查询的问题
+		Properties: properties, // queryString 指的是用户查询的问题
 	})
 
 	if err != nil {
@@ -152,7 +162,7 @@ func (d *WeaviateProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Weaviate] statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[Weaviate] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -160,9 +170,12 @@ func (d *WeaviateProvider) UploadAnswerAndEmbedding(
 }
 
 type weaviateProperties struct {
-	Question string `json:"question"`
-	Answer   string `json:"answer"`
-	Consumer string `json:"consumer"`
+	Question   string `json:"question"`
+	Answer     string `json:"answer"`
+	Consumer   string `json:"consumer"`
+	WrittenAt  int64  `json:"writtenAt,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	Complete   bool   `json:"complete,omitempty"`
 }
 
 type weaviateInsertRequest struct {
@@ -176,32 +189,37 @@ type weaviateQueryRequest struct {
 }
 
 func (d *WeaviateProvider) parseQueryResponse(responseBody []byte, log log.Log) ([]QueryResult, error) {
-	log.Infof("[Weaviate] queryResp: %s", string(responseBody))
+	LogPayload(log, nil, "[Weaviate] queryResp", 0, responseBody)
 
 	if !gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.0._additional.distance", d.config.collectionID)).Exists() {
-		log.Errorf("[Weaviate] No distance found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Weaviate] No distance found in response", responseBody)
 		return nil, errors.New("[Weaviate] No distance found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.0.question", d.config.collectionID)).Exists() {
-		log.Errorf("[Weaviate] No question found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Weaviate] No question found in response", responseBody)
 		return nil, errors.New("[Weaviate] No question found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.0.answer", d.config.collectionID)).Exists() {
-		log.Errorf("[Weaviate] No answer found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Weaviate] No answer found in response", responseBody)
 		return nil, errors.New("[Weaviate] No answer found in response body")
 	}
 
 	resultNum := gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.#", d.config.collectionID)).Int()
 	results := make([]QueryResult, 0, resultNum)
 	for i := 0; i < int(resultNum); i++ {
+		prefix := fmt.Sprintf("data.Get.%s.%d", d.config.collectionID, i)
 		result := QueryResult{
-			Text:     gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.%d.question", d.config.collectionID, i)).String(),
-			Score:    gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.%d._additional.distance", d.config.collectionID, i)).Float(),
-			Answer:   gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.%d.answer", d.config.collectionID, i)).String(),
-			Consumer: gjson.GetBytes(responseBody, fmt.Sprintf("data.Get.%s.%d.consumer", d.config.collectionID, i)).String(),
+			Text:     gjson.GetBytes(responseBody, prefix+".question").String(),
+			Score:    gjson.GetBytes(responseBody, prefix+"._additional.distance").Float(),
+			Answer:   gjson.GetBytes(responseBody, prefix+".answer").String(),
+			Consumer: gjson.GetBytes(responseBody, prefix+".consumer").String(),
 		}
+		applyMetadata(&result, "",
+			gjson.GetBytes(responseBody, prefix+"."+WrittenAtField),
+			gjson.GetBytes(responseBody, prefix+"."+GenerationField),
+			gjson.GetBytes(responseBody, prefix+"."+CompleteField))
 		results = append(results, result)
 	}
 

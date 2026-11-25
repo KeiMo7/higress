@@ -26,6 +26,28 @@ Plugin Execution Priority: `10`
 - During a rolling upgrade, old nodes can still read old data. Drain old nodes and clean the old namespace before cutover, or take the old version offline before completing the transition.
 - `enableSemanticCache` always defaults to `false`, even when a vector provider is configured. Existing semantic-cache users must explicitly set `enableSemanticCache: true`, `vector.threshold`, and `vector.thresholdRelation`. Threshold has no numeric default, and an explicit `0` remains `0`. Providers expose incompatible distance or similarity scales and directions, so the relation must also be chosen explicitly.
 
+## Entry Policy (entryPolicy)
+
+`entryPolicy` makes "is this entry trustworthy, when does it expire, who may see it" a single judgment. When it is absent or `enabled: false`, behavior is identical to previous releases: key format, stored value, response templates, the skip switch, and skipping all cache work without an authenticated consumer are unchanged.
+
+| Name | Type | Requirement | Default | Description |
+| --- | --- | --- | --- | --- |
+| entryPolicy.enabled | bool | optional | false | Turns the unified entry judgment on. Exact writes then store an entry envelope and semantic records carry the same metadata |
+| entryPolicy.generation | string | required when enabled | - | Revision marker. Changing it makes old-generation entries miss immediately on read, with no scan and no downtime. An empty value fails config load |
+| entryPolicy.ttlSeconds | int | optional | inherits cache.cacheTTL | Lifetime in seconds shared by the exact and semantic sides. `0` means no expiry; a negative value fails config load |
+
+When enabled:
+
+- A stored entry carries its write time, visible tenant, generation and completeness. The exact read, the semantic backfill and the direct semantic answer all use the same judgment: tenant, generation, completeness and lifetime must all pass.
+- Only a properly terminated response is stored: a stream must contain `[DONE]`, a non-stream response must have a `finish_reason` other than `length`, the upstream status must be 2xx, and responses with tool calls or parse failures are not stored.
+- No hit path writes anything back, and no hit path extends or revives an expired entry.
+- Entries without metadata and old semantic records are recognized as legacy and treated as a miss; they never fail the request. Redis `SETEX` keeps the exact side from reading past the shared lifetime.
+- Among duplicate semantic records for the same tenant and question, the newest valid one wins; equal write times break deterministically by record ID so repeated calls agree.
+- Observability: hits set `cache_source` (`kv` / `semantic` / `backfill`), misses set `cache_miss_reason` (`absent` / `expired` / `generation_mismatch` / `incomplete` / `tenant_mismatch` / `legacy_format` / `backend_error`), and backend degradation sets `cache_degraded` (`kv` / `semantic`). With the policy on, logs contain only non-reversible identifiers, never questions, answers or tenant names.
+- A failure on either side degrades to the other side only; when both are unavailable the request forwards normally and no backend error reaches the caller.
+
+Semantic records require the collection or index schema to accept the `writtenAt`, `generation` and `complete` fields. Key-value entries are stored as a `{"higressEntry":1,...}` envelope, and old values are recognized as legacy automatically.
+
 ## Configuration Description
 
 The configuration is divided into 3 parts: Vector Database (vector), Text Embedding Service (embedding), and Cache Service (cache). It also provides fine-grained LLM request/response extraction parameter configurations.
@@ -41,6 +63,7 @@ This plugin supports both vector database-based semantic caching and string matc
 | cache | object | optional | - | Cache service configuration, see Cache Service section below |
 | cacheKeyStrategy | string | optional | "lastQuestion" | Strategy for generating cache key from historical questions. Options: "lastQuestion" (use last question), "allQuestions" (concatenate all questions), or "disabled" (disable caching) |
 | enableSemanticCache | bool | optional | false | Whether to enable semantic caching. A vector provider does not enable it automatically; threshold and thresholdRelation are required when enabled |
+| entryPolicy | object | optional | - | Entry policy that unifies entry identity, metadata, completeness, lifetime, generation and tenant judgment across the exact and semantic sides. See Entry Policy above |
 
 Depending on whether semantic caching is needed, you can configure component combinations as follows:
 1. `cache`: Enable string matching cache only
@@ -100,6 +123,7 @@ If you do not configure a related component, you can ignore the `required` field
 | cacheKeyFrom | string | optional | "messages.@reverse.0.content" | Extract string from request Body using [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) syntax |
 | cacheValueFrom | string | optional | "choices.0.message.content" | Extract string from response Body using [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) syntax |
 | cacheStreamValueFrom | string | optional | "choices.0.delta.content" | Extract string from streaming response Body using [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) syntax |
+| cacheFinishReasonFrom | string | optional | "choices.0.finish_reason" | Extract the termination reason from a non-stream response Body for the completeness judgment |
 | cacheToolCallsFrom | string | optional | "choices.0.delta.content.tool_calls" | Extract string from streaming response Body using [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) syntax |
 | responseTemplate | string | optional | `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"from-cache","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}` | Template for returning HTTP response, with %s marking the part to be replaced by cache value |
 | streamResponseTemplate | string | optional | `data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"from-cache","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}\n\ndata:[DONE]\n\n` | Template for returning streaming HTTP response, with %s marking the part to be replaced by cache value |

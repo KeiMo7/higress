@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/higress-group/wasm-go/pkg/log"
@@ -91,11 +92,12 @@ type result struct {
 func (d *DvProvider) constructEmbeddingQueryParameters(vector []float64, consumer string) (string, []byte, [][2]string, error) {
 	url := fmt.Sprintf("/v1/collections/%s/query", d.config.collectionID)
 
+	filter := fmt.Sprintf("consumer = '%s'", strings.ReplaceAll(consumer, "'", "\\'"))
 	requestData := queryRequest{
 		Vector:        vector,
 		TopK:          d.config.topK,
 		IncludeVector: false,
-		Filter:        fmt.Sprintf("consumer = '%s'", strings.ReplaceAll(consumer, "'", "\\'")),
+		Filter:        filter,
 	}
 
 	requestBody, err := json.Marshal(requestData)
@@ -130,7 +132,7 @@ func (d *DvProvider) QueryEmbedding(
 		return ErrConsumerRequired
 	}
 	url, body, headers, err := d.constructEmbeddingQueryParameters(emb, consumer)
-	log.Debugf("url:%s, body:%s, headers:%v", url, string(body), headers)
+	LogPayload(log, ctx, "dashvector query request", 0, body)
 	if err != nil {
 		err = fmt.Errorf("failed to construct embedding query parameters: %v", err)
 		return err
@@ -144,7 +146,7 @@ func (d *DvProvider) QueryEmbedding(
 				callback(nil, ctx, log, err)
 				return
 			}
-			log.Debugf("query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "query embedding response", statusCode, responseBody)
 			results, err := d.ParseQueryResponse(responseBody, ctx, log)
 			if err != nil {
 				err = fmt.Errorf("failed to parse query response: %v", err)
@@ -182,7 +184,9 @@ func (d *DvProvider) ParseQueryResponse(responseBody []byte, ctx wrapper.HttpCon
 			Score:     output.Score,
 			Answer:    getStringValue(output.Fields, "answer"),
 			Consumer:  getStringValue(output.Fields, TenantField),
+			ID:        output.ID,
 		}
+		applyMapMetadata(&result, output.ID, output.Fields)
 		results = append(results, result)
 	}
 
@@ -198,16 +202,22 @@ type insertRequest struct {
 	Docs []document `json:"docs"`
 }
 
-func (d *DvProvider) constructUploadParameters(emb []float64, queryString string, answer string, consumer string) (string, []byte, [][2]string, error) {
+func (d *DvProvider) constructUploadParameters(ctx wrapper.HttpContext, emb []float64, queryString string, answer string, consumer string) (string, []byte, [][2]string, error) {
 	url := "/v1/collections/" + d.config.collectionID + "/docs"
 
+	fields := map[string]string{
+		"query":     queryString,
+		"answer":    answer,
+		TenantField: consumer,
+	}
+	if m, ok := metadataPayload(ctx); ok {
+		fields[WrittenAtField] = strconv.FormatInt(m.WrittenAt, 10)
+		fields[GenerationField] = m.Generation
+		fields[CompleteField] = strconv.FormatBool(m.Complete)
+	}
 	doc := document{
 		Vector: emb,
-		Fields: map[string]string{
-			"query":     queryString,
-			"answer":    answer,
-			TenantField: consumer,
-		},
+		Fields: fields,
 	}
 
 	requestBody, err := json.Marshal(insertRequest{Docs: []document{doc}})
@@ -228,7 +238,7 @@ func (d *DvProvider) UploadEmbedding(queryString string, queryEmb []float64, ctx
 	if consumer == "" {
 		return ErrConsumerRequired
 	}
-	url, body, headers, err := d.constructUploadParameters(queryEmb, queryString, "", consumer)
+	url, body, headers, err := d.constructUploadParameters(ctx, queryEmb, queryString, "", consumer)
 	if err != nil {
 		return err
 	}
@@ -237,7 +247,7 @@ func (d *DvProvider) UploadEmbedding(queryString string, queryEmb []float64, ctx
 		headers,
 		body,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "dashvector response", statusCode, responseBody)
 			if statusCode != http.StatusOK {
 				err = fmt.Errorf("failed to upload embedding: %d", statusCode)
 			}
@@ -252,7 +262,7 @@ func (d *DvProvider) UploadAnswerAndEmbedding(queryString string, queryEmb []flo
 	if consumer == "" {
 		return ErrConsumerRequired
 	}
-	url, body, headers, err := d.constructUploadParameters(queryEmb, queryString, queryAnswer, consumer)
+	url, body, headers, err := d.constructUploadParameters(ctx, queryEmb, queryString, queryAnswer, consumer)
 	if err != nil {
 		return err
 	}
@@ -261,7 +271,7 @@ func (d *DvProvider) UploadAnswerAndEmbedding(queryString string, queryEmb []flo
 		headers,
 		body,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "dashvector response", statusCode, responseBody)
 			if statusCode != http.StatusOK {
 				err = fmt.Errorf("failed to upload embedding: %d", statusCode)
 			}

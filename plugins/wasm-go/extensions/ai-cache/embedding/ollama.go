@@ -91,7 +91,7 @@ func (t *ollamaProvider) constructParameters(text string) (string, [][2]string, 
 	headers := [][2]string{
 		{"Content-Type", "application/json"},
 	}
-	log.Debugf("constructParameters: %s", string(requestBody))
+	logEmbeddingPayload("constructParameters", 0, requestBody)
 
 	return OLLAMA_ENDPOINT, headers, requestBody, err
 }
@@ -137,7 +137,7 @@ func (t *ollamaProvider) GetEmbedding(
 				return
 			}
 
-			log.Debugf("get embedding response: %d, %s", statusCode, responseBody)
+			logEmbeddingPayload("get embedding response", statusCode, responseBody)
 
 			if len(resp.Embeddings) == 0 {
 				err = errors.New("no embedding found in response")

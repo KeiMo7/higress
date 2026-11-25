@@ -160,7 +160,7 @@ func (t *TIProvider) GetEmbedding(
 				return
 			}
 
-			log.Debugf("get embedding response: %d, %s", statusCode, responseBody)
+			logEmbeddingPayload("get embedding response", statusCode, responseBody)
 
 			resp, err = t.parseTextEmbedding(responseBody)
 			if err != nil {

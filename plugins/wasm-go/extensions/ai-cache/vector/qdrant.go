@@ -45,9 +45,12 @@ func (c *qdrantProvider) GetProviderType() string {
 }
 
 type qdrantPayload struct {
-	Question string `json:"question"`
-	Answer   string `json:"answer"`
-	Consumer string `json:"consumer"`
+	Question   string `json:"question"`
+	Answer     string `json:"answer"`
+	Consumer   string `json:"consumer"`
+	WrittenAt  int64  `json:"writtenAt,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	Complete   bool   `json:"complete,omitempty"`
 }
 
 type qdrantPoint struct {
@@ -89,12 +92,18 @@ func (d *qdrantProvider) UploadAnswerAndEmbedding(
 	// 	  }
 	//   ]
 	// }
+	payload := qdrantPayload{Question: queryString, Answer: queryAnswer, Consumer: consumer}
+	if m, ok := metadataPayload(ctx); ok {
+		payload.WrittenAt = m.WrittenAt
+		payload.Generation = m.Generation
+		payload.Complete = m.Complete
+	}
 	requestBody, err := json.Marshal(qdrantInsertRequest{
 		Points: []qdrantPoint{
 			{
 				ID:      uuid.New().String(),
 				Vector:  queryEmb,
-				Payload: qdrantPayload{Question: queryString, Answer: queryAnswer, Consumer: consumer},
+				Payload: payload,
 			},
 		},
 	})
@@ -112,7 +121,7 @@ func (d *qdrantProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Qdrant] statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[Qdrant] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -180,7 +189,7 @@ func (d *qdrantProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Qdrant] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[Qdrant] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[Qdrant] Failed to parse query response: %v", err)
@@ -211,24 +220,30 @@ func (d *qdrantProvider) parseQueryResponse(responseBody []byte, log log.Log) ([
 	// 	]
 	// }
 	if !gjson.GetBytes(responseBody, "result.0.score").Exists() {
-		log.Errorf("[Qdrant] No distance found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Qdrant] No distance found in response", responseBody)
 		return nil, errors.New("[Qdrant] No distance found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, "result.0.payload.answer").Exists() {
-		log.Errorf("[Qdrant] No answer found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Qdrant] No answer found in response", responseBody)
 		return nil, errors.New("[Qdrant] No answer found in response body")
 	}
 
 	resultNum := gjson.GetBytes(responseBody, "result.#").Int()
 	results := make([]QueryResult, 0, resultNum)
 	for i := 0; i < int(resultNum); i++ {
+		prefix := fmt.Sprintf("result.%d.payload", i)
 		result := QueryResult{
-			Text:     gjson.GetBytes(responseBody, fmt.Sprintf("result.%d.payload.question", i)).String(),
+			Text:     gjson.GetBytes(responseBody, prefix+".question").String(),
 			Score:    gjson.GetBytes(responseBody, fmt.Sprintf("result.%d.score", i)).Float(),
-			Answer:   gjson.GetBytes(responseBody, fmt.Sprintf("result.%d.payload.answer", i)).String(),
-			Consumer: gjson.GetBytes(responseBody, fmt.Sprintf("result.%d.payload.consumer", i)).String(),
+			Answer:   gjson.GetBytes(responseBody, prefix+".answer").String(),
+			Consumer: gjson.GetBytes(responseBody, prefix+".consumer").String(),
 		}
+		applyMetadata(&result,
+			gjson.GetBytes(responseBody, fmt.Sprintf("result.%d.id", i)).String(),
+			gjson.GetBytes(responseBody, prefix+"."+WrittenAtField),
+			gjson.GetBytes(responseBody, prefix+"."+GenerationField),
+			gjson.GetBytes(responseBody, prefix+"."+CompleteField))
 		results = append(results, result)
 	}
 

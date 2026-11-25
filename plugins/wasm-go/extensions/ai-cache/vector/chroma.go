@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/higress-group/wasm-go/pkg/log"
@@ -87,7 +88,7 @@ func (d *ChromaProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Chroma] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[Chroma] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[Chroma] Failed to parse query response: %v", err)
@@ -134,11 +135,17 @@ func (d *ChromaProvider) UploadAnswerAndEmbedding(
 	// 	  "id1"
 	// 	]
 	// }
+	metadata := chromaMetadataMap{TenantField: consumer, "question": queryString}
+	if m, ok := metadataPayload(ctx); ok {
+		metadata[WrittenAtField] = strconv.FormatInt(m.WrittenAt, 10)
+		metadata[GenerationField] = m.Generation
+		metadata[CompleteField] = strconv.FormatBool(m.Complete)
+	}
 	requestBody, err := json.Marshal(chromaInsertRequest{
 		Embeddings: []chromaEmbedding{queryEmb},
 		IDs:        []string{uuid.New().String()},
 		Documents:  []string{queryAnswer}, // queryAnswer 指的是用户查询的问题的答案
-		Metadatas:  []chromaMetadataMap{{TenantField: consumer, "question": queryString}},
+		Metadatas:  []chromaMetadataMap{metadata},
 	})
 
 	if err != nil {
@@ -153,7 +160,7 @@ func (d *ChromaProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Chroma] statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[Chroma] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -240,18 +247,26 @@ func (d *ChromaProvider) parseQueryResponse(responseBody []byte, log log.Log) ([
 	for i := 0; i < n; i++ {
 		consumer := ""
 		text := ids[0][i]
-		if len(queryResp.Metadatas) > 0 && i < len(queryResp.Metadatas[0]) {
-			consumer = queryResp.Metadatas[0][i][TenantField]
-			if question := queryResp.Metadatas[0][i]["question"]; question != "" {
-				text = question
-			}
+		result := QueryResult{
+			Text:   text,
+			Score:  distances[i],
+			Answer: documents[i],
 		}
-		results = append(results, QueryResult{
-			Text:     text,
-			Score:    distances[i],
-			Answer:   documents[i],
-			Consumer: consumer,
-		})
+		if len(queryResp.Metadatas) > 0 && i < len(queryResp.Metadatas[0]) {
+			metadata := queryResp.Metadatas[0][i]
+			consumer = metadata[TenantField]
+			if question := metadata["question"]; question != "" {
+				text = question
+				result.Text = question
+			}
+			fields := make(map[string]interface{}, len(metadata))
+			for k, v := range metadata {
+				fields[k] = v
+			}
+			applyMapMetadata(&result, result.ID, fields)
+		}
+		result.Consumer = consumer
+		results = append(results, result)
 	}
 	return results, nil
 }

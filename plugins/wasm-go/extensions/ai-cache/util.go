@@ -27,6 +27,18 @@ func handleNonStreamChunk(ctx wrapper.HttpContext, c config.PluginConfig, chunk 
 	return nil
 }
 
+// lenContent returns the size of an accumulated buffer without printing it.
+func lenContent(value interface{}) int {
+	switch v := value.(type) {
+	case []byte:
+		return len(v)
+	case string:
+		return len(v)
+	default:
+		return 0
+	}
+}
+
 func unifySSEChunk(data []byte) []byte {
 	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
 	data = bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
@@ -36,7 +48,7 @@ func unifySSEChunk(data []byte) []byte {
 func handleStreamChunk(ctx wrapper.HttpContext, c config.PluginConfig, chunk []byte, log log.Log) error {
 	var partialMessage []byte
 	partialMessageI := ctx.GetContext(PARTIAL_MESSAGE_CONTEXT_KEY)
-	log.Debugf("[handleStreamChunk] cache content: %v", ctx.GetContext(CACHE_CONTENT_CONTEXT_KEY))
+	log.Debugf("[handleStreamChunk] cache content bytes: %d", lenContent(ctx.GetContext(CACHE_CONTENT_CONTEXT_KEY)))
 	if partialMessageI != nil {
 		pm, ok := partialMessageI.([]byte)
 		if !ok {
@@ -80,8 +92,13 @@ func processNonStreamLastChunk(ctx wrapper.HttpContext, c config.PluginConfig, c
 	bodyJson := gjson.ParseBytes(body)
 	value := bodyJson.Get(c.CacheValueFrom).String()
 	if strings.TrimSpace(value) == "" {
-		return "", fmt.Errorf("[processNonStreamLastChunk] parse value from response body failed, body:%s", body)
+		return "", fmt.Errorf("[processNonStreamLastChunk] parse value from response body failed")
 	}
+	// Record the termination reason so the write gate can distinguish a normal
+	// ending from a mid-stream truncation. finish_reason may be absent; absence
+	// is treated as "unknown" and blocks the write.
+	finishReason := bodyJson.Get(c.CacheFinishReasonFrom).String()
+	ctx.SetContext(RESPONSE_TERMINATION_CONTEXT_KEY, finishReason)
 	return value, nil
 }
 
@@ -100,7 +117,7 @@ func processStreamLastChunk(ctx wrapper.HttpContext, c config.PluginConfig, chun
 			lastMessage = chunk
 		}
 		if !strings.HasSuffix(string(lastMessage), "\n\n") {
-			return "", fmt.Errorf("[processStreamLastChunk] invalid lastMessage:%s", lastMessage)
+			return "", fmt.Errorf("[processStreamLastChunk] invalid last message shape, bytes=%d", len(lastMessage))
 		}
 		lastMessage = lastMessage[:len(lastMessage)-2]
 		value, err := processSSEMessage(ctx, c, string(lastMessage), log)
@@ -137,7 +154,7 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 	// 早 return 丢弃（PR #3962 review）。
 	done := false
 	for _, chunk := range strings.Split(sseMessage, "\n\n") {
-		log.Debugf("single sse message: %s", chunk)
+		log.Debugf("single sse message, bytes=%d", len(chunk))
 		subMessages := strings.Split(chunk, "\n")
 		var message string
 		for _, msg := range subMessages {
@@ -147,7 +164,7 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 			}
 		}
 		if len(message) < 6 {
-			return content, fmt.Errorf("[processSSEMessage] invalid message: %s", message)
+			return content, fmt.Errorf("[processSSEMessage] invalid message shape, bytes=%d", len(message))
 		}
 
 		// skip the prefix "data:"
@@ -156,6 +173,7 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 		if strings.TrimSpace(bodyJson) == "[DONE]" {
 			// 跳出循环，把已解析的局部 content 留到循环外统一合并。
 			done = true
+			ctx.SetContext(STREAM_DONE_CONTEXT_KEY, struct{}{})
 			break
 		}
 
@@ -176,7 +194,7 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 
 	// 本次 sseMessage 既没解析到 content 也没遇到 [DONE]：保持 ctx 不变，直接返回。
 	if content == "" && !done {
-		log.Debugf("[processSSEMessage] no content extracted; skipping cache update: %s", sseMessage)
+		log.Debugf("[processSSEMessage] no content extracted; skipping cache update, bytes=%d", len(sseMessage))
 		return "", nil
 	}
 

@@ -77,7 +77,7 @@ func (d *ESProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[ES] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[ES] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[ES] Failed to parse query response: %v", err)
@@ -122,12 +122,18 @@ func (d *ESProvider) UploadAnswerAndEmbedding(
 	// 	  "你吃了吗？"
 	// 	]
 	// }
-	requestBody, err := json.Marshal(esInsertRequest{
+	request := esInsertRequest{
 		Embedding: queryEmb,
 		Question:  queryString,
 		Answer:    queryAnswer,
 		Consumer:  consumer,
-	})
+	}
+	if m, ok := metadataPayload(ctx); ok {
+		request.WrittenAt = m.WrittenAt
+		request.Generation = m.Generation
+		request.Complete = m.Complete
+	}
+	requestBody, err := json.Marshal(request)
 	if err != nil {
 		log.Errorf("[ES] Failed to marshal upload embedding request body: %v", err)
 		return err
@@ -141,7 +147,7 @@ func (d *ESProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[ES] statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[ES] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -149,10 +155,13 @@ func (d *ESProvider) UploadAnswerAndEmbedding(
 }
 
 type esInsertRequest struct {
-	Embedding []float64 `json:"embedding"`
-	Question  string    `json:"question"`
-	Answer    string    `json:"answer"`
-	Consumer  string    `json:"consumer"`
+	Embedding  []float64 `json:"embedding"`
+	Question   string    `json:"question"`
+	Answer     string    `json:"answer"`
+	Consumer   string    `json:"consumer"`
+	WrittenAt  int64     `json:"writtenAt,omitempty"`
+	Generation string    `json:"generation,omitempty"`
+	Complete   bool      `json:"complete,omitempty"`
 }
 
 type knn struct {
@@ -191,7 +200,7 @@ type esQueryResponse struct {
 
 func (d *ESProvider) parseQueryResponse(responseBody []byte, log log.Log) ([]QueryResult, error) {
 	if log != nil {
-		log.Infof("[ES] responseBody: %s", string(responseBody))
+		LogPayload(log, nil, "[ES] responseBody", 0, responseBody)
 	}
 	var queryResp esQueryResponse
 	err := json.Unmarshal(responseBody, &queryResp)
@@ -221,6 +230,7 @@ func (d *ESProvider) parseQueryResponse(responseBody []byte, log log.Log) ([]Que
 			Answer:   answer,
 			Consumer: consumer,
 		}
+		applyMapMetadata(&result, hit.ID, hit.Source)
 		results = append(results, result)
 	}
 	return results, nil

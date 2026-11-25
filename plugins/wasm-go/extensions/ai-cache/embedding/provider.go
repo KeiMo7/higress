@@ -3,6 +3,7 @@ package embedding
 import (
 	"errors"
 
+	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
 )
@@ -111,4 +112,23 @@ type Provider interface {
 		queryString string,
 		ctx wrapper.HttpContext,
 		callback func(emb []float64, err error)) error
+}
+
+// payloadLoggingOff mirrors the ai-cache entry policy. When entry semantics are
+// enabled the embedding request and response carry the question, so raw
+// payloads must not be logged.
+var payloadLoggingOff bool
+
+// SetPayloadLoggingOff disables raw payload logging for every embedding
+// provider. Config load calls it once.
+func SetPayloadLoggingOff(off bool) {
+	payloadLoggingOff = off
+}
+
+func logEmbeddingPayload(prefix string, status int, body []byte) {
+	if payloadLoggingOff {
+		log.Debugf("%s: status=%d bodyBytes=%d", prefix, status, len(body))
+		return
+	}
+	log.Debugf("%s: %d, %s", prefix, status, body)
 }

@@ -177,7 +177,7 @@ func (d *DSProvider) GetEmbedding(
 				return
 			}
 
-			log.Debugf("get embedding response: %d, %s", statusCode, responseBody)
+			logEmbeddingPayload("get embedding response", statusCode, responseBody)
 
 			resp, err = d.parseTextEmbedding(responseBody)
 			if err != nil {

@@ -2,10 +2,14 @@ package vector
 
 import (
 	"errors"
+	"strconv"
+	"strings"
 
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
+
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/entry"
 )
 
 const (
@@ -19,7 +23,50 @@ const (
 
 	ConsumerContextKey = "aiCacheAuthenticatedConsumer"
 	TenantField        = "consumer"
+
+	// Entry metadata fields stored alongside a vector record. They mirror the
+	// key-value entry metadata so both sides obey the same judgment.
+	WrittenAtField  = "writtenAt"
+	GenerationField = "generation"
+	CompleteField   = "complete"
+
+	entryMetadataContextKey        = "aiCacheEntryMetadata"
+	entryMetadataEnabledContextKey = "aiCacheEntryMetadataEnabled"
 )
+
+// SetEntryMetadataEnabled records that the reader/writer should carry entry
+// metadata. When unset, providers keep their previous payload and query shape
+// so existing schemas and behavior are untouched.
+func SetEntryMetadataEnabled(ctx wrapper.HttpContext) {
+	if ctx != nil {
+		ctx.SetContext(entryMetadataEnabledContextKey, true)
+	}
+}
+
+// EntryMetadataEnabled reports whether entry metadata must be carried.
+func EntryMetadataEnabled(ctx wrapper.HttpContext) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.GetContext(entryMetadataEnabledContextKey).(bool)
+	return enabled
+}
+
+// SetEntryMetadata records the metadata to attach to the next upload.
+func SetEntryMetadata(ctx wrapper.HttpContext, m entry.Metadata) {
+	if ctx != nil {
+		ctx.SetContext(entryMetadataContextKey, m)
+	}
+}
+
+// EntryMetadataFromContext returns the metadata recorded for the next upload.
+func EntryMetadataFromContext(ctx wrapper.HttpContext) (entry.Metadata, bool) {
+	if ctx == nil {
+		return entry.Metadata{}, false
+	}
+	m, ok := ctx.GetContext(entryMetadataContextKey).(entry.Metadata)
+	return m, ok
+}
 
 // ConsumerFromContext returns the consumer recorded after consumer
 // authentication. Ai-cache must run after that authentication stage.
@@ -57,6 +104,186 @@ type QueryResult struct {
 	Score     float64   // 文本的向量相似度或距离等度量
 	Answer    string    // 相似文本对应的LLM生成的回答
 	Consumer  string    // 上传时记录的认证 consumer
+	WrittenAt int64     // 上传时记录的写入时刻（秒）
+	// WrittenAtPresent distinguishes an absent write time from a stored zero.
+	WrittenAtPresent bool
+	Generation       string
+	Complete         bool
+	// MetadataPresent records that the record carried the current-format entry
+	// metadata. A record without it is a legacy record and must not be served.
+	MetadataPresent bool
+	// ID is the backend record identifier, used only for logging.
+	ID string
+}
+
+// EntryMetadata derives entry metadata from a query result.
+func (r QueryResult) EntryMetadata() (entry.Metadata, bool) {
+	if !r.MetadataPresent || !r.WrittenAtPresent {
+		return entry.Metadata{}, false
+	}
+	return entry.Metadata{
+		WrittenAt:  r.WrittenAt,
+		Tenant:     r.Consumer,
+		Generation: r.Generation,
+		Complete:   r.Complete,
+	}, true
+}
+
+// parseInt64Value accepts a JSON number or a numeric string, because vector
+// backends differ on how they store numeric payload fields.
+func parseInt64Value(value gjson.Result) (int64, bool) {
+	if !value.Exists() {
+		return 0, false
+	}
+	switch value.Type {
+	case gjson.Number:
+		return value.Int(), true
+	case gjson.String:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(value.String()), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+// parseBoolValue accepts a JSON boolean or its string form.
+func parseBoolValue(value gjson.Result) (bool, bool) {
+	if !value.Exists() {
+		return false, false
+	}
+	switch value.Type {
+	case gjson.True:
+		return true, true
+	case gjson.False:
+		return false, true
+	case gjson.String:
+		switch strings.TrimSpace(value.String()) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// applyMetadata fills the entry metadata of a result. MetadataPresent stays
+// false unless every metadata field is readable, so a partial record is
+// recognized as legacy instead of being guessed into a valid entry. The record
+// ID is only retained for current-format records so legacy results keep their
+// previous shape.
+func applyMetadata(result *QueryResult, id string, writtenAt, generation, complete gjson.Result) {
+	written, writtenOK := parseInt64Value(writtenAt)
+	done, doneOK := parseBoolValue(complete)
+	if !writtenOK || !doneOK || !generation.Exists() || generation.Type != gjson.String {
+		return
+	}
+	result.WrittenAt = written
+	result.WrittenAtPresent = true
+	result.Generation = generation.String()
+	result.Complete = done
+	result.MetadataPresent = true
+	result.ID = id
+}
+
+// applyMapMetadata is the map-shaped variant used by providers whose response
+// decodes into generic JSON objects. It applies exactly the same all-or-nothing
+// rule as applyMetadata.
+func applyMapMetadata(result *QueryResult, id string, fields map[string]interface{}) {
+	written, writtenOK := parseInt64Any(fields[WrittenAtField])
+	generation, generationOK := fields[GenerationField].(string)
+	done, doneOK := parseBoolAny(fields[CompleteField])
+	if !writtenOK || !generationOK || !doneOK {
+		return
+	}
+	result.WrittenAt = written
+	result.WrittenAtPresent = true
+	result.Generation = generation
+	result.Complete = done
+	result.MetadataPresent = true
+	result.ID = id
+}
+
+func parseInt64Any(value interface{}) (int64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int64(v), true
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func parseBoolAny(value interface{}) (bool, bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		switch strings.TrimSpace(v) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// metadataPayload returns the fields to attach to an upload. It is empty when
+// the new entry semantics are off.
+func metadataPayload(ctx wrapper.HttpContext) (entry.Metadata, bool) {
+	if !EntryMetadataEnabled(ctx) {
+		return entry.Metadata{}, false
+	}
+	return EntryMetadataFromContext(ctx)
+}
+
+// payloadLoggingOff is set when entry semantics are enabled. Backend payloads
+// then contain questions and answers, so they must never reach the log. The
+// value is fixed at config load and read-only afterwards.
+var payloadLoggingOff bool
+
+// SetPayloadLoggingOff disables raw payload logging. Config load calls it once
+// when entryPolicy.enabled is true.
+func SetPayloadLoggingOff(off bool) {
+	payloadLoggingOff = off
+}
+
+// LogPayload logs a backend payload with a non-reversible size marker when
+// payload logging is disabled.
+func LogPayload(log log.Log, ctx wrapper.HttpContext, prefix string, status int, body []byte) {
+	if log == nil {
+		return
+	}
+	if payloadLoggingOff || EntryMetadataEnabled(ctx) {
+		log.Debugf("%s: status=%d bodyBytes=%d", prefix, status, len(body))
+		return
+	}
+	log.Debugf("%s: %d, %s", prefix, status, body)
+}
+
+// LogPayloadError logs a malformed-payload diagnosis without echoing the body.
+func LogPayloadError(log log.Log, ctx wrapper.HttpContext, prefix string, body []byte) {
+	if log == nil {
+		return
+	}
+	if payloadLoggingOff || EntryMetadataEnabled(ctx) {
+		log.Errorf("%s: bodyBytes=%d", prefix, len(body))
+		return
+	}
+	log.Errorf("%s: %s", prefix, body)
 }
 
 type Provider interface {

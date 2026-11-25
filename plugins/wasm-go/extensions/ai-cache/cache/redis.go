@@ -62,6 +62,13 @@ func (rp *redisProvider) Set(key string, value string, cb wrapper.RedisResponseC
 	}
 }
 
+func (rp *redisProvider) SetWithTTL(key string, value string, ttl int, cb wrapper.RedisResponseCallback) error {
+	if ttl <= 0 {
+		return rp.client.Set(key, value, cb)
+	}
+	return rp.client.SetEx(key, value, ttl, cb)
+}
+
 func (rp *redisProvider) GetCacheKeyPrefix() string {
 	return rp.config.cacheKeyPrefix
 }

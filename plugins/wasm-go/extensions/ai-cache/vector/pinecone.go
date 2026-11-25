@@ -48,9 +48,12 @@ func (c *pineconeProvider) GetProviderType() string {
 }
 
 type pineconeMetadata struct {
-	Question string `json:"question"`
-	Answer   string `json:"answer"`
-	Consumer string `json:"consumer"`
+	Question   string `json:"question"`
+	Answer     string `json:"answer"`
+	Consumer   string `json:"consumer"`
+	WrittenAt  int64  `json:"writtenAt,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	Complete   bool   `json:"complete,omitempty"`
 }
 
 type pineconeVector struct {
@@ -86,12 +89,18 @@ func (d *pineconeProvider) UploadAnswerAndEmbedding(
 	// 	  }
 	// 	]
 	// }
+	properties := pineconeMetadata{Question: queryString, Answer: queryAnswer, Consumer: consumer}
+	if m, ok := metadataPayload(ctx); ok {
+		properties.WrittenAt = m.WrittenAt
+		properties.Generation = m.Generation
+		properties.Complete = m.Complete
+	}
 	requestBody, err := json.Marshal(pineconeInsertRequest{
 		Vectors: []pineconeVector{
 			{
 				ID:         uuid.New().String(),
 				Values:     queryEmb,
-				Properties: pineconeMetadata{Question: queryString, Answer: queryAnswer, Consumer: consumer},
+				Properties: properties,
 			},
 		},
 		Namespace: d.config.collectionID,
@@ -110,7 +119,7 @@ func (d *pineconeProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Pinecone] statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[Pinecone] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -164,7 +173,7 @@ func (d *pineconeProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Pinecone] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[Pinecone] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[Pinecone] Failed to parse query response: %v", err)
@@ -177,29 +186,35 @@ func (d *pineconeProvider) QueryEmbedding(
 
 func (d *pineconeProvider) parseQueryResponse(responseBody []byte, log log.Log) ([]QueryResult, error) {
 	if !gjson.GetBytes(responseBody, "matches.0.score").Exists() {
-		log.Errorf("[Pinecone] No distance found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Pinecone] No distance found in response", responseBody)
 		return nil, errors.New("[Pinecone] No distance found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, "matches.0.metadata.question").Exists() {
-		log.Errorf("[Pinecone] No question found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Pinecone] No question found in response", responseBody)
 		return nil, errors.New("[Pinecone] No question found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, "matches.0.metadata.answer").Exists() {
-		log.Errorf("[Pinecone] No answer found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Pinecone] No answer found in response", responseBody)
 		return nil, errors.New("[Pinecone] No answer found in response body")
 	}
 
 	resultNum := gjson.GetBytes(responseBody, "matches.#").Int()
 	results := make([]QueryResult, 0, resultNum)
 	for i := 0; i < int(resultNum); i++ {
+		prefix := fmt.Sprintf("matches.%d", i)
 		result := QueryResult{
-			Text:     gjson.GetBytes(responseBody, fmt.Sprintf("matches.%d.metadata.question", i)).String(),
-			Score:    gjson.GetBytes(responseBody, fmt.Sprintf("matches.%d.score", i)).Float(),
-			Answer:   gjson.GetBytes(responseBody, fmt.Sprintf("matches.%d.metadata.answer", i)).String(),
-			Consumer: gjson.GetBytes(responseBody, fmt.Sprintf("matches.%d.metadata.consumer", i)).String(),
+			Text:     gjson.GetBytes(responseBody, prefix+".metadata.question").String(),
+			Score:    gjson.GetBytes(responseBody, prefix+".score").Float(),
+			Answer:   gjson.GetBytes(responseBody, prefix+".metadata.answer").String(),
+			Consumer: gjson.GetBytes(responseBody, prefix+".metadata.consumer").String(),
 		}
+		applyMetadata(&result,
+			gjson.GetBytes(responseBody, prefix+".id").String(),
+			gjson.GetBytes(responseBody, prefix+".metadata."+WrittenAtField),
+			gjson.GetBytes(responseBody, prefix+".metadata."+GenerationField),
+			gjson.GetBytes(responseBody, prefix+".metadata."+CompleteField))
 		results = append(results, result)
 	}
 

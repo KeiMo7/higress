@@ -31,6 +31,28 @@ LLM 结果缓存插件，默认配置方式可以直接用于 openai 协议的�
 - 滚动升级期间，旧节点仍可能读取旧数据。切换前应排空旧节点并清理旧 namespace，或先下线旧版本，再完成切换。
 - `enableSemanticCache` 始终默认为 `false`，即使配置了 vector provider 也不会自动开启。现有语义缓存用户必须显式设置 `enableSemanticCache: true`、`vector.threshold` 和 `vector.thresholdRelation`。threshold 没有数值默认值，显式配置 `0` 时保留为 `0`。不同 provider 使用不可直接比较的距离或相似度刻度及方向，因此 thresholdRelation 也必须显式选择。
 
+## 条目治理（entryPolicy）
+
+`entryPolicy` 把「条目是否可信、何时失效、对谁可见」收敛为一套判定。未配置或 `enabled: false` 时行为与旧版本完全一致：键格式、写入值、响应模板、跳过开关、无认证身份时跳过缓存均不变。
+
+| Name | Type | Requirement | Default | Description |
+| --- | --- | --- | --- | --- |
+| entryPolicy.enabled | bool | optional | false | 是否启用统一条目判定。开启后精确缓存写入带元信息的条目，语义记录也带同样元信息 |
+| entryPolicy.generation | string | 开启时 required | - | 代次标识。变更后旧代次条目在读取时立即不再命中，不遍历存量、不停机。为空时配置加载失败 |
+| entryPolicy.ttlSeconds | int | optional | 继承 cache.cacheTTL | 精确缓存与语义缓存共用的存活时长（秒）。`0` 表示不过期；负数时配置加载失败 |
+
+开启后：
+
+- 写入的条目携带写入时刻、可见租户、代次与完整性结论。精确读取、语义回查与语义直接返回都走同一个判定：租户、代次、完整性、有效期四项全部通过才命中。
+- 只有正常收尾的响应才会写入：流式必须出现 `[DONE]`，非流式必须有终止原因（`finish_reason`）且不能是 `length`，上游状态码必须为 2xx，工具调用与解析失败的响应不写入。
+- 任何命中路径都不会把结果写回键值侧，也不会延长或复活过期条目。
+- 没有元信息的旧条目与旧语义记录被识别为旧格式并视为未命中，不会导致请求失败。Redis 的 `SETEX` 保证键值侧不会读到超过存活时长的条目。
+- 同一租户同一语义问题的多条记录取「最新写入且有效」的一条，写入时刻相同时按记录 ID 确定性排序，多次调用结果一致。
+- 观测字段：命中写入 `cache_source`（`kv` / `semantic` / `backfill`），未命中写入 `cache_miss_reason`（`absent` / `expired` / `generation_mismatch` / `incomplete` / `tenant_mismatch` / `legacy_format` / `backend_error`），后端降级写入 `cache_degraded`（`kv` / `semantic`）。开启后日志不再输出问题、答案与租户明文，只输出不可反推的标识。
+- 语义与键值任一侧不可用只降级为另一侧；两侧都不可用时请求照常转发，不向调用方抛错。
+
+语义记录需要 collection/index schema 额外允许 `writtenAt`、`generation`、`complete` 三个字段；键值条目以 `{"higressEntry":1,...}` 信封形式存储，旧值自动识别为旧格式。
+
 ## 配置说明
 配置分为 3 个部分：向量数据库（vector）；文本向量化接口（embedding）；缓存数据库（cache），同时也提供了细粒度的 LLM 请求/响应提取参数配置等。
 
@@ -47,6 +69,7 @@ LLM 结果缓存插件，默认配置方式可以直接用于 openai 协议的�
 | cache | object | optional | - | 缓存服务配置，详见下文缓存服务配置 |
 | cacheKeyStrategy | string | optional | "lastQuestion" | 决定如何根据历史问题生成缓存键的策略。可选值: "lastQuestion" (使用最后一个问题), "allQuestions" (拼接所有问题) 或 "disabled" (禁用缓存) |
 | enableSemanticCache | bool | optional | false | 是否启用语义化缓存。即使配置了 vector provider 也不会自动开启；启用时必须同时显式配置 threshold 和 thresholdRelation |
+| entryPolicy | object | optional | - | 条目治理策略，统一精确缓存与语义缓存的条目身份、元信息、完整性、有效期、代次与租户判定，详见上文条目治理 |
 
 根据是否需要启用语义缓存，可以只配置组件的组合为:
 1. `cache`: 仅启用字符串匹配缓存
@@ -105,6 +128,7 @@ LLM 结果缓存插件，默认配置方式可以直接用于 openai 协议的�
 | cacheKeyFrom | string | optional | "messages.@reverse.0.content"                                                                                                                                                                                                                               | 从请求 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串 |
 | cacheValueFrom | string | optional | "choices.0.message.content"                                                                                                                                                                                                                                 | 从响应 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串 |
 | cacheStreamValueFrom | string | optional | "choices.0.delta.content"                                                                                                                                                                                                                                   | 从流式响应 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串 |
+| cacheFinishReasonFrom | string | optional | "choices.0.finish_reason" | 从非流式响应 Body 中提取终止原因，用于完整性判定 |
 | cacheToolCallsFrom | string | optional | "choices.0.delta.content.tool_calls"                                                                                                                                                                                                                        | 从流式响应 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串 |
 | responseTemplate | string | optional | `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"from-cache","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`                       | 返回 HTTP 响应的模版，用 %s 标记需要被 cache value 替换的部分 |
 | streamResponseTemplate | string | optional | `data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"from-cache","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}\n\ndata:[DONE]\n\n`| 返回流式 HTTP 响应的模版，用 %s 标记需要被 cache value 替换的部分 |

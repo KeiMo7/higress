@@ -16,6 +16,19 @@ const (
 	DEFAULT_CACHE_PREFIX = "higress-ai-cache:"
 )
 
+// payloadLoggingOff mirrors the entry policy for the key-value side.
+var payloadLoggingOff bool
+
+// SetPayloadLoggingOff records whether stored values may be logged verbatim.
+func SetPayloadLoggingOff(off bool) {
+	payloadLoggingOff = off
+}
+
+// PayloadLoggingOff reports whether stored values must stay out of logs.
+func PayloadLoggingOff() bool {
+	return payloadLoggingOff
+}
+
 // BuildCacheKey is the single key constructor for exact reads, writes, and
 // Redis lookups after a semantic hit. The authenticated consumer is part of
 // the digest input, while the configured prefix is applied exactly once.
@@ -139,6 +152,11 @@ func (c *ProviderConfig) Validate() error {
 	return nil
 }
 
+// GetCacheTTL returns the configured legacy cache lifetime in seconds.
+func (c *ProviderConfig) GetCacheTTL() int {
+	return c.cacheTTL
+}
+
 func CreateProvider(pc ProviderConfig, log log.Log) (Provider, error) {
 	initializer, has := providerInitializers[pc.typ]
 	if !has {
@@ -152,5 +170,9 @@ type Provider interface {
 	Init(username string, password string, timeout uint32) error
 	Get(key string, cb wrapper.RedisResponseCallback) error
 	Set(key string, value string, cb wrapper.RedisResponseCallback) error
+	// SetWithTTL stores a value with an explicit lifetime in seconds. A
+	// non-positive ttl stores without a time limit. The entry policy uses this
+	// so a single configured lifetime applies to every write path.
+	SetWithTTL(key string, value string, ttl int, cb wrapper.RedisResponseCallback) error
 	GetCacheKeyPrefix() string
 }

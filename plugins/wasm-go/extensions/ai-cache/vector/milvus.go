@@ -44,10 +44,13 @@ func (c *milvusProvider) GetProviderType() string {
 }
 
 type milvusData struct {
-	Vector   []float64 `json:"vector"`
-	Question string    `json:"question,omitempty"`
-	Answer   string    `json:"answer,omitempty"`
-	Consumer string    `json:"consumer"`
+	Vector     []float64 `json:"vector"`
+	Question   string    `json:"question,omitempty"`
+	Answer     string    `json:"answer,omitempty"`
+	Consumer   string    `json:"consumer"`
+	WrittenAt  int64     `json:"writtenAt,omitempty"`
+	Generation string    `json:"generation,omitempty"`
+	Complete   bool      `json:"complete,omitempty"`
 }
 
 type milvusInsertRequest struct {
@@ -84,16 +87,20 @@ func (d *milvusProvider) UploadAnswerAndEmbedding(
 	// 	  }
 	//   ]
 	// }
+	data := milvusData{
+		Question: queryString,
+		Answer:   queryAnswer,
+		Vector:   queryEmb,
+		Consumer: consumer,
+	}
+	if m, ok := metadataPayload(ctx); ok {
+		data.WrittenAt = m.WrittenAt
+		data.Generation = m.Generation
+		data.Complete = m.Complete
+	}
 	requestBody, err := json.Marshal(milvusInsertRequest{
 		CollectionName: d.config.collectionID,
-		Data: []milvusData{
-			{
-				Question: queryString,
-				Answer:   queryAnswer,
-				Vector:   queryEmb,
-				Consumer: consumer,
-			},
-		},
+		Data:           []milvusData{data},
 	})
 
 	if err != nil {
@@ -109,7 +116,7 @@ func (d *milvusProvider) UploadAnswerAndEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Milvus] statusCode:%d, responseBody:%s", statusCode, string(responseBody))
+			LogPayload(log, ctx, "[Milvus] upload response", statusCode, responseBody)
 			callback(ctx, log, err)
 		},
 		d.config.timeout,
@@ -162,12 +169,8 @@ func (d *milvusProvider) QueryEmbedding(
 		Data:           [][]float64{emb},
 		AnnsField:      "vector",
 		Limit:          d.config.topK,
-		OutputFields: []string{
-			"question",
-			"answer",
-			TenantField,
-		},
-		Filter: fmt.Sprintf("consumer == %s", consumerString),
+		OutputFields:   outputFields(ctx),
+		Filter:         fmt.Sprintf("consumer == %s", consumerString),
 	})
 	if err != nil {
 		log.Errorf("[Milvus] Failed to marshal query embedding: %v", err)
@@ -182,7 +185,7 @@ func (d *milvusProvider) QueryEmbedding(
 		},
 		requestBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			log.Debugf("[Milvus] Query embedding response: %d, %s", statusCode, responseBody)
+			LogPayload(log, ctx, "[Milvus] Query embedding response", statusCode, responseBody)
 			results, err := d.parseQueryResponse(responseBody, log)
 			if err != nil {
 				err = fmt.Errorf("[Milvus] Failed to parse query response: %v", err)
@@ -195,31 +198,45 @@ func (d *milvusProvider) QueryEmbedding(
 
 func (d *milvusProvider) parseQueryResponse(responseBody []byte, log log.Log) ([]QueryResult, error) {
 	if !gjson.GetBytes(responseBody, "data.0.distance").Exists() {
-		log.Errorf("[Milvus] No distance found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Milvus] No distance found in response", responseBody)
 		return nil, errors.New("[Milvus] No distance found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, "data.0.question").Exists() {
-		log.Errorf("[Milvus] No question found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Milvus] No question found in response", responseBody)
 		return nil, errors.New("[Milvus] No question found in response body")
 	}
 
 	if !gjson.GetBytes(responseBody, "data.0.answer").Exists() {
-		log.Errorf("[Milvus] No answer found in response body: %s", responseBody)
+		LogPayloadError(log, nil, "[Milvus] No answer found in response", responseBody)
 		return nil, errors.New("[Milvus] No answer found in response body")
 	}
 
 	resultNum := gjson.GetBytes(responseBody, "data.#").Int()
 	results := make([]QueryResult, 0, resultNum)
 	for i := 0; i < int(resultNum); i++ {
+		prefix := fmt.Sprintf("data.%d", i)
 		result := QueryResult{
-			Text:     gjson.GetBytes(responseBody, fmt.Sprintf("data.%d.question", i)).String(),
-			Score:    gjson.GetBytes(responseBody, fmt.Sprintf("data.%d.distance", i)).Float(),
-			Answer:   gjson.GetBytes(responseBody, fmt.Sprintf("data.%d.answer", i)).String(),
-			Consumer: gjson.GetBytes(responseBody, fmt.Sprintf("data.%d.consumer", i)).String(),
+			Text:     gjson.GetBytes(responseBody, prefix+".question").String(),
+			Score:    gjson.GetBytes(responseBody, prefix+".distance").Float(),
+			Answer:   gjson.GetBytes(responseBody, prefix+".answer").String(),
+			Consumer: gjson.GetBytes(responseBody, prefix+".consumer").String(),
 		}
+		applyMetadata(&result, "",
+			gjson.GetBytes(responseBody, prefix+"."+WrittenAtField),
+			gjson.GetBytes(responseBody, prefix+"."+GenerationField),
+			gjson.GetBytes(responseBody, prefix+"."+CompleteField))
 		results = append(results, result)
 	}
 
 	return results, nil
+}
+
+// outputFields keeps the legacy field set unless entry metadata is enabled.
+func outputFields(ctx wrapper.HttpContext) []string {
+	fields := []string{"question", "answer", TenantField}
+	if EntryMetadataEnabled(ctx) {
+		fields = append(fields, WrittenAtField, GenerationField, CompleteField)
+	}
+	return fields
 }

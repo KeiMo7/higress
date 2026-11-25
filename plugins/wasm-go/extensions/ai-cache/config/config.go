@@ -5,6 +5,7 @@ import (
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/cache"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/embedding"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/entry"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/vector"
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/tidwall/gjson"
@@ -32,10 +33,11 @@ type PluginConfig struct {
 	vectorProviderConfig    *vector.ProviderConfig
 	cacheProviderConfig     *cache.ProviderConfig
 
-	CacheKeyFrom         string
-	CacheValueFrom       string
-	CacheStreamValueFrom string
-	CacheToolCallsFrom   string
+	CacheKeyFrom          string
+	CacheValueFrom        string
+	CacheStreamValueFrom  string
+	CacheToolCallsFrom    string
+	CacheFinishReasonFrom string
 
 	// @Title zh-CN 启用语义化缓存
 	// @Description zh-CN 控制是否启用语义化缓存功能。true 表示启用，false 表示禁用。
@@ -44,12 +46,17 @@ type PluginConfig struct {
 	// @Title zh-CN 缓存键策略
 	// @Description zh-CN 决定如何生成缓存键的策略。可选值: "lastQuestion" (使用最后一个问题), "allQuestions" (拼接所有问题) 或 "disabled" (禁用缓存)
 	CacheKeyStrategy string
+
+	// @Title zh-CN 条目治理策略
+	// @Description zh-CN 统一精确缓存与语义缓存的条目身份、元信息、完整性、有效期、代次与租户判定。未开启时行为与旧版本完全一致。
+	entryPolicy entry.Policy
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result, log log.Log) {
 	c.embeddingProviderConfig = &embedding.ProviderConfig{}
 	c.vectorProviderConfig = &vector.ProviderConfig{}
 	c.cacheProviderConfig = &cache.ProviderConfig{}
+	c.entryPolicy = entry.Policy{}
 	c.vectorProviderConfig.FromJson(json.Get("vector"))
 	c.embeddingProviderConfig.FromJson(json.Get("embedding"))
 	c.cacheProviderConfig.FromJson(json.Get("cache"))
@@ -57,6 +64,7 @@ func (c *PluginConfig) FromJson(json gjson.Result, log log.Log) {
 		// compatible with legacy config
 		c.cacheProviderConfig.ConvertLegacyJson(json)
 	}
+	c.entryPolicy.FromJson(json.Get("entryPolicy"))
 
 	c.CacheKeyStrategy = json.Get("cacheKeyStrategy").String()
 	if c.CacheKeyStrategy == "" {
@@ -77,6 +85,10 @@ func (c *PluginConfig) FromJson(json gjson.Result, log log.Log) {
 	c.CacheToolCallsFrom = json.Get("cacheToolCallsFrom").String()
 	if c.CacheToolCallsFrom == "" {
 		c.CacheToolCallsFrom = "choices.0.delta.content.tool_calls"
+	}
+	c.CacheFinishReasonFrom = json.Get("cacheFinishReasonFrom").String()
+	if c.CacheFinishReasonFrom == "" {
+		c.CacheFinishReasonFrom = "choices.0.finish_reason"
 	}
 
 	c.StreamResponseTemplate = json.Get("streamResponseTemplate").String()
@@ -103,6 +115,13 @@ func (c *PluginConfig) Validate() error {
 		if !c.vectorProviderConfig.HasThresholdRelation() {
 			return fmt.Errorf("vector.thresholdRelation is required when enableSemanticCache is true")
 		}
+	}
+
+	// The entry policy inherits cache.cacheTTL when entryPolicy.ttlSeconds is
+	// absent, so it must be resolved before validation.
+	c.entryPolicy.Resolve(c.cacheProviderConfig.GetCacheTTL())
+	if err := c.entryPolicy.Validate(); err != nil {
+		return err
 	}
 
 	// if cache provider is configured, validate it
@@ -148,6 +167,12 @@ func (c *PluginConfig) Validate() error {
 
 func (c *PluginConfig) Complete(log log.Log) error {
 	var err error
+	// With entry semantics enabled, backend payloads and messages carry
+	// questions, answers and tenant names, so raw payload logging is disabled
+	// for every provider.
+	cache.SetPayloadLoggingOff(c.entryPolicy.Enabled)
+	embedding.SetPayloadLoggingOff(c.entryPolicy.Enabled)
+	vector.SetPayloadLoggingOff(c.entryPolicy.Enabled)
 	if c.embeddingProviderConfig.GetProviderType() != "" {
 		log.Debugf("embedding provider is set to %s", c.embeddingProviderConfig.GetProviderType())
 		c.embeddingProvider, err = embedding.CreateProvider(*c.embeddingProviderConfig)
@@ -195,6 +220,12 @@ func (c *PluginConfig) GetVectorProviderConfig() vector.ProviderConfig {
 
 func (c *PluginConfig) GetCacheProvider() cache.Provider {
 	return c.cacheProvider
+}
+
+// GetEntryPolicy returns the resolved entry policy. The zero value means the
+// new entry semantics are off and behavior is unchanged.
+func (c *PluginConfig) GetEntryPolicy() entry.Policy {
+	return c.entryPolicy
 }
 
 func convertLegacyMapFields(c *PluginConfig, json gjson.Result, log log.Log) {

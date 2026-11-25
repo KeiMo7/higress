@@ -291,7 +291,7 @@ func (t *XfyunProvider) GetEmbedding(
 				return
 			}
 
-			log.Debugf("get embedding response: %d, %s", statusCode, responseBody)
+			logEmbeddingPayload("get embedding response", statusCode, responseBody)
 
 			if len(resp) == 0 {
 				err = errors.New("no embedding found in response")
